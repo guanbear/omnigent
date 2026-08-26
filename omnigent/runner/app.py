@@ -7176,14 +7176,29 @@ def create_runner_app(
             # When called from _run_turn_bg_setup_and_stream, dispatch is set and
             # harness_body already carries composed instructions — composing again
             # would double-count the authored text.
+            # Use _resolve_session_spec_entry (not _resolve_turn_spec_lazy) so the
+            # sub-agent swap is applied and the CHILD spec's instructions are used.
             _instr_body = body
             if dispatch is None:
-                _instr_entry, _ = await _resolve_turn_spec_lazy()
-                _instr_spec = _unwrap_resolved_spec(_instr_entry)
-                if _instr_spec is not None:
-                    _per_req_instr = cast(str | None, body.get("instructions"))
-                    _composed_instr = build_instructions(_instr_spec, _per_req_instr, [])
-                    _instr_body = {**body, "instructions": _composed_instr}
+                with contextlib.suppress(OmnigentError, httpx.HTTPError, RuntimeError, ValueError):
+                    _instr_entry_ds = await _resolve_session_spec_entry(conv_id)
+                    _instr_spec_ds = _unwrap_resolved_spec(_instr_entry_ds)
+                    if _instr_spec_ds is not None:
+                        _per_req_instr = cast(str | None, body.get("instructions"))
+                        _composed_instr = build_instructions(_instr_spec_ds, _per_req_instr, [])
+                        _instr_body = {**body, "instructions": _composed_instr}
+            # Re-emit the unresolvable-sub-agent warning on every turn so callers
+            # that missed the session-create warning (e.g. a reconnect) still see it.
+            _ds_sa = _session_sub_agent_names.get(conv_id)
+            if _ds_sa:
+                _ds_cached_entry = _session_spec_cache.get(conv_id)
+                _ds_cached_spec = _unwrap_resolved_spec(_ds_cached_entry)
+                if _ds_cached_spec is not None:
+                    _ds_sub = _native_runtime._resolve_sub_agent_spec_entry(
+                        _ds_cached_entry, _ds_sa
+                    )
+                    if _ds_sub is None:
+                        _warn_unresolved_sub_agent(conv_id, _ds_sa)
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
@@ -9335,6 +9350,9 @@ def create_runner_app(
         async with lock:
             if session_id in _session_spec_cache:
                 return _session_spec_cache[session_id]
+            # Capture generation before the first await so a reset that runs
+            # while we await the snapshot/resolver doesn't pin stale data.
+            _spec_fill_gen = _session_snapshot_generation.get(session_id, 0)
             snapshot = await _session_snapshot(session_id)
             if not snapshot.ok:
                 raise OmnigentError(
@@ -9369,7 +9387,9 @@ def create_runner_app(
                         _warn_unresolved_sub_agent(session_id, sub_agent_name)
                     else:
                         spec_entry = sub_entry
-            _session_spec_cache[session_id] = spec_entry
+            # Only cache if the generation hasn't moved (no reset while awaiting).
+            if _session_snapshot_generation.get(session_id, 0) == _spec_fill_gen:
+                _session_spec_cache[session_id] = spec_entry
             return spec_entry
 
     async def _resolve_session_agent_spec(session_id: str) -> AgentSpec | None:
