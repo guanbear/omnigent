@@ -2894,8 +2894,7 @@ def create_runner_app(
                 agent_name=agent_name,
             )
             if snapshot.ok and snapshot.agent_id is not None:
-                # Only write back if the generation hasn't moved (no reset occurred
-                # while we awaited the server fetch).
+                # Discard if a reset ran while awaiting.
                 if _session_snapshot_generation.get(session_id, 0) == _fill_generation:
                     _session_snapshot_cache[session_id] = snapshot
             return snapshot
@@ -3909,9 +3908,7 @@ def create_runner_app(
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
-        # Bump (not pop) the generation so any in-flight fill that captured the
-        # pre-delete generation cannot re-populate a deleted session's caches.
-        # Popping would reset to 0 and let a stale fill's generation==0 match.
+        # Bump so any in-flight fill that captured the old generation discards its write.
         _session_snapshot_generation[session_id] = (
             _session_snapshot_generation.get(session_id, 0) + 1
         )
@@ -6551,11 +6548,7 @@ def create_runner_app(
         if _sa_name and cached_spec is not None:
             sub_entry = _native_runtime._resolve_sub_agent_spec_entry(cached_spec_entry, _sa_name)
             if sub_entry is None:
-                # Warn unless the resolution result was a confirmed success
-                # (True = child spec is already cached; the sub-agent miss here
-                # means "child in hand, not a real miss").  False or None both
-                # mean a real miss — warn. This correctly handles the edge case
-                # where parent.name == sub_agent_name.
+                # Warn unless the child was confirmed resolved (True = already cached).
                 if _session_sub_agent_resolved.get(conv) is not True:
                     _warn_unresolved_sub_agent(conv, _sa_name)
             else:
@@ -6595,10 +6588,7 @@ def create_runner_app(
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
             )
-            # Compose instructions. For gated harnesses that read the wire
-            # instructions field directly (opencode-native, hermes), use the
-            # nullable form so the "You are a helpful assistant." fallback
-            # never reaches them when no real content exists.
+            # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
             if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                 instructions = build_instructions_nullable(
@@ -6944,8 +6934,7 @@ def create_runner_app(
             dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
         )
         _note_session_harness_override(conv_id, cast(str | None, body.get("harness_override")))
-        # Mirror the background path's agent-switch invalidation so both dispatch
-        # paths use the shared _invalidate_session_agent_state routine.
+        # Shared agent-switch invalidation for both dispatch paths.
         _ds_agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
         _ds_prior = _session_agent_ids.get(conv_id)
         if _ds_agent_id and _ds_prior is not None and _ds_prior != _ds_agent_id:
@@ -7157,11 +7146,7 @@ def create_runner_app(
                 yield _response_failed_event({"message": _err_msg, "type": _err_type})
                 return
 
-            # Compose instructions for the direct-stream path (dispatch is None).
-            # When called from _run_turn_bg_setup_and_stream dispatch is set and
-            # harness_body already carries composed instructions — composing again
-            # would double-count the authored text.
-            # Use _resolve_session_spec_entry so the sub-agent swap is applied.
+            # Compose instructions for direct-stream turns (dispatch is None; background path pre-composes).
             _instr_body = body
             if dispatch is None:
                 with contextlib.suppress(OmnigentError, httpx.HTTPError, RuntimeError, ValueError):
@@ -7176,10 +7161,7 @@ def create_runner_app(
                                 _instr_spec_ds, _per_req_instr, []
                             ),
                         )
-                        # Gated harnesses (opencode-native, hermes) must not
-                        # receive the fabricated "You are a helpful assistant."
-                        # fallback — use the nullable composed value (None when
-                        # nothing meaningful to send).
+                        # Gated harnesses get nullable — skip the fallback literal.
                         if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
                             _instr_val = _ic_ds.composed
                             if _instr_val is not None:
@@ -7191,9 +7173,6 @@ def create_runner_app(
                                     _instr_spec_ds, _per_req_instr, []
                                 ),
                             }
-                        # Warn once per (conversation, harness, delivery) when the
-                        # agent has authored instructions but the harness can't
-                        # deliver them.
                         if _authored_ds and harness_name:
                             _ds_caps = harness_capabilities().get(harness_name)
                             _ds_delivery = (
@@ -7222,11 +7201,7 @@ def create_runner_app(
                                         _ds_delivery.value,
                                         extra={"session_id": conv_id},
                                     )
-            # Re-emit the unresolvable-sub-agent warning on every turn when the
-            # session-create resolution positively established a miss (False), so
-            # callers that reconnect after the create warning still see the signal.
-            # Only warn when the resolution result is False (miss) — True means the
-            # child was resolved and cached; absent means unknown/no sub-agent.
+            # Re-warn on every turn when session-create established a miss.
             _ds_sa = _session_sub_agent_names.get(conv_id)
             if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:
                 _warn_unresolved_sub_agent(conv_id, _ds_sa)
@@ -9381,8 +9356,7 @@ def create_runner_app(
         async with lock:
             if session_id in _session_spec_cache:
                 return _session_spec_cache[session_id]
-            # Capture generation before the first await so a reset that runs
-            # while we await the snapshot/resolver doesn't pin stale data.
+            # Capture before first await so a concurrent reset discards the write.
             _spec_fill_gen = _session_snapshot_generation.get(session_id, 0)
             snapshot = await _session_snapshot(session_id)
             if not snapshot.ok:
@@ -9420,7 +9394,6 @@ def create_runner_app(
                     else:
                         spec_entry = sub_entry
                         _session_sub_agent_resolved[session_id] = True
-            # Only cache if the generation hasn't moved (no reset while awaiting).
             if _session_snapshot_generation.get(session_id, 0) == _spec_fill_gen:
                 _session_spec_cache[session_id] = spec_entry
             return spec_entry
