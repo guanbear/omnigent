@@ -14,7 +14,16 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    Strict,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from omnigent.entities import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
@@ -1209,7 +1218,19 @@ class ElicitationResult(BaseModel):
     content: dict[str, str | int | float | bool | list[str] | None] | None = None
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
+    # ``_meta`` must serialize under its alias so the verdict survives the
+    # resolve route's dump -> re-validate round-trip, but an unset ``_meta``
+    # must not appear at all: hook replies are compared verbatim.
     model_config = ConfigDict(serialize_by_alias=True)
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_meta(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Drop ``_meta`` when unset, keeping other ``None`` fields intact."""
+        data = handler(self)
+        if self.meta is None:
+            data.pop("_meta", None)
+            data.pop("meta", None)
+        return data
 
 
 # ── Sessions (/v1/sessions) ────────────────────────────────────
