@@ -1197,6 +1197,9 @@ class ElicitationResult(BaseModel):
         binary approve/reject elicitations and for ``decline`` /
         ``cancel`` actions. Values are restricted to JSON scalars
         and string lists per the MCP spec.
+    :param meta: Optional MCP result metadata. Codex uses
+        ``_meta.persist`` to distinguish one-time, session-scoped,
+        and persistent MCP tool approvals.
     """
 
     action: Literal["accept", "decline", "cancel"]
@@ -1204,6 +1207,9 @@ class ElicitationResult(BaseModel):
     # ElicitResult.content value type — keep them aligned so an MCP
     # client can bridge to our endpoint without translation.
     content: dict[str, str | int | float | bool | list[str] | None] | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+    model_config = ConfigDict(serialize_by_alias=True)
 
 
 # ── Sessions (/v1/sessions) ────────────────────────────────────
