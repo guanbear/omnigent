@@ -41,6 +41,7 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
+  PlusIcon,
   SearchIcon,
   Settings2Icon,
   ShareIcon,
@@ -135,6 +136,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
+import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
@@ -3217,10 +3219,6 @@ function ConversationRow({
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [leaveOpen, setLeaveOpen] = useState(false);
-  // True while an archive is in flight. Drives the "Archiving…" status
-  // row — without it the row shows nothing while the archive completes.
-  // Delete needs no counterpart: it drops its row optimistically.
-  const [isArchiving, setIsArchiving] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
   // effective-permission level, so rename/share/move/drag are owner-only and
@@ -3398,21 +3396,6 @@ function ConversationRow({
     );
   }
 
-  // Archiving is a single PATCH (see runArchive); show a status row for the
-  // span instead of leaving the row looking idle. The spinner stays up until
-  // the row itself leaves the sidebar: on success the list refetches and this
-  // row unmounts (dropped from the default view), which removes the spinner
-  // with it — it is deliberately NOT cleared on PATCH-settle, or it would
-  // vanish a round-trip before the row does. On failure the flag clears and
-  // the interactive row returns so the user can retry.
-  if (isArchiving) {
-    return (
-      <li>
-        <ArchivingRow label={label} />
-      </li>
-    );
-  }
-
   function confirmDelete() {
     // Fire-and-forget: close the dialog and drop the row immediately so the
     // user isn't blocked on the (potentially slow) DELETE — server-side
@@ -3430,39 +3413,25 @@ function ConversationRow({
 
   function runArchive() {
     const nextArchived = !isArchived;
-    // Unarchiving is a quick flag flip — no status row.
-    if (!nextArchived) {
-      archive.mutate({ id: conversation.id, archived: false });
-      return;
-    }
-    // Archiving sends only the PATCH: the server stops the session (and
-    // tears down a host-spawned runner) in the background once the flag is
-    // committed. Sending a client stop too would race that one against the
-    // same runner, and the loser gets a 503 from the already-killed pane.
+    // The archive PATCH sends only the flag: the server stops the session (and
+    // tears down a host-spawned runner) in the background once it's committed.
+    // A client stop too would race that one against the same runner, and the
+    // loser gets a 503 from the already-killed pane.
     //
-    // "Archiving…" must stay up until the row actually LEAVES the sidebar,
-    // not merely until the PATCH resolves. The PATCH success only kicks off
-    // an async `["conversations"]` refetch (see useArchiveConversation); the
-    // row drops out a round-trip later, once that refetch lands and the
-    // archived row is filtered out of the rendered list. Clearing the
-    // spinner on settle (the old behavior) reopened that gap: the row flashed
-    // back to its plain, clickable form — spinner gone — while the session
-    // was still listed. So we DON'T clear it on success: this row unmounts
-    // when the refetch removes it, which tears the spinner down with it.
-    // Only an error clears the flag, restoring the interactive row for retry.
-    setIsArchiving(true);
-    archive.mutate(
-      { id: conversation.id, archived: true },
-      {
-        // Point the user at where the session went — it's no longer in
-        // the sidebar list, so surface its new home in Settings.
-        onSuccess: () => {
-          if (isActive) navigate("/", { replace: true });
-          showArchivedToast();
-        },
-        onError: () => setIsArchiving(false),
-      },
-    );
+    // The row leaves the sidebar optimistically (useArchiveConversation flips
+    // the cached `archived` flag in onMutate; the list filters archived rows
+    // out client-side), so this component unmounts on the next frame. Leaving
+    // the archived session's chat surface therefore has to happen HERE,
+    // synchronously — not in an onSuccess callback that fires a round-trip
+    // later with a stale `isActive`, which used to jump the user off whatever
+    // session they'd switched to meanwhile. Mirrors confirmDelete.
+    if (nextArchived && isActive) navigate("/", { replace: true });
+    archive.mutate({ id: conversation.id, archived: nextArchived });
+    // Point the user at where the session went — fire NOW, not in a mutate
+    // onSuccess: the optimistic overlay unmounts this row on the next frame,
+    // and per-call mutate callbacks don't fire once their observer unmounts.
+    // A failed archive reconciles the row back with its own error toast.
+    if (nextArchived) showArchivedToast();
   }
 
   function confirmLeave() {
@@ -3999,30 +3968,6 @@ function PinnedProjectFlyoutContent({
   );
 }
 
-/**
- * In-flight status row shown while a session is being archived (the
- * archive PATCH in ConversationRow.runArchive). Delete has no
- * counterpart: it removes its row optimistically, so there is nothing
- * left to show progress on. Archive failures fall back to the
- * interactive row rather than a persistent error state, so there's no
- * retry/dismiss affordance here.
- */
-function ArchivingRow({ label }: { label: string }) {
-  return (
-    <div
-      className={cn(SIDEBAR_ROW, "flex w-full items-center text-muted-foreground opacity-70")}
-      data-testid="conversation-archiving"
-      aria-live="polite"
-    >
-      <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden />
-      <span className="min-w-0 flex-1 truncate" title={label}>
-        {label}
-      </span>
-      <span className="shrink-0 text-sm">Archiving…</span>
-    </div>
-  );
-}
-
 // ── ProjectFolderActions ──────────────────────────────────────────────────────
 
 /**
@@ -4462,9 +4407,13 @@ function ProjectPickerMenu({
   const { data: projects = [] } = useProjects();
   const [search, setSearch] = useState("");
 
-  const filtered = search
-    ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
+  const trimmed = search.trim();
+  const filtered = trimmed
+    ? projects.filter((p) => p.name.toLowerCase().includes(trimmed.toLowerCase()))
     : projects;
+  // Offer create only when the typed name isn't already an exact project.
+  const canCreate =
+    trimmed.length > 0 && !projects.some((p) => p.name.toLowerCase() === trimmed.toLowerCase());
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -4478,7 +4427,7 @@ function ProjectPickerMenu({
         <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <input
           className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-          placeholder="Search projects"
+          placeholder="Search or create project"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           onKeyDown={swallowKeys}
@@ -4493,10 +4442,21 @@ function ProjectPickerMenu({
             )}
           </C.Item>
         ))}
-        {filtered.length === 0 && (
+        {filtered.length === 0 && !canCreate && (
           <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
         )}
       </div>
+      {canCreate && (
+        <div className="border-t pt-1">
+          <C.Item className="px-2 py-1" onSelect={() => onSelect(trimmed)}>
+            <PlusIcon className="size-3.5 shrink-0 text-muted-foreground" />
+            Create{" "}
+            <span className="truncate rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
+              {trimmed}
+            </span>
+          </C.Item>
+        </div>
+      )}
       {currentProject && (
         <div className="border-t pt-1">
           <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
@@ -4571,6 +4531,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
       <input
         ref={inputRef}
         type="text"
+        maxLength={USER_SESSION_TITLE_MAX_CHARS}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onCompositionStart={() => {
@@ -4724,28 +4685,22 @@ function BulkActionBar({
 
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
-    bulkArchive.mutate(
-      { ids: nonArchivedSelected.map((c) => c.id), archived: true },
-      {
-        onSuccess: () => {
-          if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
-            navigate("/", { replace: true });
-          onDeselectAll();
-        },
-      },
-    );
+    // The rows leave the sidebar optimistically (useBulkArchiveConversations
+    // flips their cached `archived` flag in onMutate), so this bar unmounts
+    // with the selection. Navigate and deselect NOW rather than in a
+    // mutate-level callback — a callback on the unmounted observer never fires,
+    // and it would carry a stale `activeId` that could jump the user off a
+    // session they switched to meanwhile. Mirrors handleDelete.
+    if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
+      navigate("/", { replace: true });
+    onDeselectAll();
+    bulkArchive.mutate({ ids: nonArchivedSelected.map((c) => c.id), archived: true });
   }
 
   function handleUnarchive() {
     if (archivedSelected.length === 0) return;
-    bulkArchive.mutate(
-      { ids: archivedSelected.map((c) => c.id), archived: false },
-      {
-        onSuccess: () => {
-          onDeselectAll();
-        },
-      },
-    );
+    onDeselectAll();
+    bulkArchive.mutate({ ids: archivedSelected.map((c) => c.id), archived: false });
   }
 
   function handleDelete() {

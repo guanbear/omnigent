@@ -59,7 +59,13 @@ from omnigent.harness_aliases import (
     native_terminal_name,
 )
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
-from omnigent.harness_plugins import load_object, model_env_keys, spawn_env_builders
+from omnigent.harness_capabilities import InstructionDelivery
+from omnigent.harness_plugins import (
+    harness_capabilities,
+    load_object,
+    model_env_keys,
+    spawn_env_builders,
+)
 from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.summarize import (
@@ -153,6 +159,11 @@ from omnigent.runner.subagent_routing import (
     session_routing_class,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.runtime.prompt import (
+    build_instructions,
+    build_instructions_nullable,
+    raw_author_instructions,
+)
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -422,6 +433,14 @@ _RUNNER_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 _WAKE_POST_MAX_ATTEMPTS = 3
 _WAKE_POST_RETRY_BASE_DELAY_S = 0.5
 _WAKE_POST_RETRY_MAX_DELAY_S = 4.0
+# Delays before each stranded-wake re-attempt round after a tunnel reconnect.
+# The reconnect callback fires BEFORE the new tunnel connection is established,
+# and the server 503s an injected parent event while the parent's runner is
+# still offline — so pace the rounds to outlast a slow handshake instead of
+# spending the bounded per-POST retries against a not-yet-open tunnel. The
+# final long round covers a server that is reachable but slow to become ready;
+# rounds cost nothing once no parent is stranded (the loop exits early).
+_STRANDED_WAKE_RETRY_DELAYS_S = (2.0, 5.0, 10.0, 30.0)
 # 4xx statuses that are transient and worth retrying (mirrors the forwarder's
 # classification): everything else in 4xx is a permanent client-side rejection.
 _WAKE_POST_TRANSIENT_4XX = frozenset({408, 409, 425, 429})
@@ -1123,6 +1142,37 @@ class TurnDispatch:
     client_side_tool_names: frozenset[str] = frozenset()
 
 
+@dataclasses.dataclass
+class InstructionComposition:
+    """Runner-local, never-serialized view of this turn's instruction state.
+
+    Computed once inside ``_stream_message_to_harness`` (the point where the
+    background and direct-stream dispatch paths converge) and consumed
+    in-process by the single delivery-gap warn check and by delivery
+    channels (opencode-native, hermes) that must not leak the fabricated
+    ``"You are a helpful assistant."`` fallback. Never attached to
+    ``TurnDispatch``, ``MessageEvent``, ``CreateResponseRequest``, or
+    ``ExecutorConfig`` — the wire shape is unchanged from today.
+
+    :param authored_present: Whether ``AgentSpec.instructions`` is
+        non-empty/non-whitespace, resolved pre-composition.
+    :param composed: The meaningful composed text (author + applicable
+        framework instructions), or ``None`` if there is truly nothing.
+    """
+
+    authored_present: bool
+    composed: str | None
+
+
+# Harnesses whose executor reads the wire ``instructions`` field itself and
+# needs the gated ``InstructionComposition.composed`` value there instead of
+# the default fallback-including composed-per-turn string — opencode-native
+# via its NativePrompt.system_prompt; hermes via HermesExecutor.run_turn's
+# system_prompt param. See the harness-conditional swap in
+# _stream_message_to_harness.
+_GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
+
+
 def _wrap_as_message_event(body: _JsonObject) -> _JsonObject:
     """
     Adapt a ``CreateResponseRequest``-shaped body into a
@@ -1681,9 +1731,12 @@ def mark_subagent_work_terminal(
                 delivered_now=False,
                 reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
             )
-        entry.status = status
-        entry.output = output
-        entry.completed_at = time.time()
+        # A late stop_session-driven "cancelled" must not downgrade an
+        # already-recorded "completed"/"failed" still awaiting delivery.
+        if status != "cancelled" or entry.status == "cancelled":
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
         return _deliver_subagent_completion(entry)
     entry.status = status
     entry.output = output
@@ -2363,6 +2416,14 @@ def create_runner_app(
 
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     _session_sub_agent_names: dict[str, str] = {}
+    # Tracks whether the sub-agent was successfully resolved on session create.
+    # True = child spec is cached; False = parent kept as fallback after miss.
+    # Absent = session has no sub_agent_name or create has not completed.
+    _session_sub_agent_resolved: dict[str, bool] = {}
+    # Per-conversation set of (harness, InstructionDelivery) pairs already
+    # warned about. Keyed by conversation so a session that switches harnesses
+    # warns again for the new pair rather than inheriting the old one's silence.
+    _instruction_delivery_warned: dict[str, set[tuple[str, InstructionDelivery]]] = {}
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
@@ -2424,6 +2485,13 @@ def create_runner_app(
     _background_tasks: set[asyncio.Task[Any]] = set()
     _subagent_wake_pending: set[str] = set()
     _last_rewake_notice: dict[str, str] = {}
+    # Parents whose wake POST exhausted its bounded retries while their inbox
+    # still held a sub-agent result (typically: the server was down when the
+    # child finished). The catch-up scan re-attempts these on tunnel reconnect.
+    _stranded_wake_parents: set[str] = set()
+    # Single-flight holder for the paced stranded-wake retry loop, so
+    # back-to-back reconnects don't stack concurrent retry loops.
+    _stranded_wake_retry_task: list[asyncio.Task[None]] = []
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
@@ -3093,6 +3161,7 @@ def create_runner_app(
             cwd=resolver_cwd,
             model_override=body.model_override,
             session_spec=_unwrap_spec_entry(_session_spec_cache.get(conversation_id)),
+            additional_instructions=body.additional_instructions,
         )
         try:
             title = await run_background_title(context)
@@ -3206,9 +3275,11 @@ def create_runner_app(
                 )
                 if _sub_entry is None:
                     _warn_unresolved_sub_agent(session_id, _sa_name_assign)
+                    _session_sub_agent_resolved[session_id] = False
                 else:
                     spec_entry = _sub_entry
                     spec = _unwrap_resolved_spec(_sub_entry)
+                    _session_sub_agent_resolved[session_id] = True
             harness_name = spec.executor.config.get("harness") or spec.executor.type
             harness_name = canonicalize_harness(harness_name) or harness_name
 
@@ -3875,6 +3946,8 @@ def create_runner_app(
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
+        _instruction_delivery_warned.pop(session_id, None)
+        _session_sub_agent_resolved.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
         _session_histories.pop(session_id, None)
@@ -3882,6 +3955,7 @@ def create_runner_app(
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
         _subagent_wake_pending.discard(session_id)
+        _stranded_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
@@ -4589,6 +4663,30 @@ def create_runner_app(
                     "detail": "Codex-native plan-mode update requires a current model.",
                 },
             )
+        from omnigent.codex_native_bridge import (
+            DeveloperInstructionsReadState,
+            read_codex_config_developer_instructions_state_from_home,
+        )
+
+        _di_read = read_codex_config_developer_instructions_state_from_home(Path(state.codex_home))
+        if _di_read.state is DeveloperInstructionsReadState.UNREADABLE:
+            _logger.warning(
+                "Codex-native plan-mode update skipped for %s: developer_instructions "
+                "config unreadable — refusing to guess and risk wiping live state.",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_settings_update_failed",
+                    "detail": (
+                        "Codex-native plan-mode update requires reading the current "
+                        "developer_instructions config; it could not be read."
+                    ),
+                },
+            )
+        developer_instructions = _di_read.value
         return await _handle_codex_native_settings_update(
             conv_id,
             {
@@ -4597,7 +4695,7 @@ def create_runner_app(
                     "settings": {
                         "model": model,
                         "reasoning_effort": effort,
-                        "developer_instructions": None,
+                        "developer_instructions": developer_instructions,
                     },
                 },
             },
@@ -5054,58 +5152,6 @@ def create_runner_app(
             },
         )
 
-    async def _apply_claude_native_plan_verdict(
-        conv_id: str,
-        data: Mapping[str, object],
-    ) -> None:
-        """
-        Key a web-UI plan verdict into Claude Code's plan-review dialog.
-
-        Claude Code ignores a ``PermissionRequest`` hook's ``allow`` for
-        ``ExitPlanMode``, so a plan approved in the web UI never reaches the
-        pane and the session stays parked on the TUI dialog. Best-effort:
-        :func:`inject_plan_verdict` no-ops unless that dialog is on screen,
-        so a non-plan verdict (or one already answered in the terminal)
-        presses nothing.
-
-        :param conv_id: Session/conversation identifier, e.g.
-            ``"conv_abc123"``.
-        :param data: The approval payload, e.g.
-            ``{"elicitation_id": "elicit_claude_ab12", "action": "accept",
-            "content": {"allow_all_edits": True}}``.
-        :returns: None.
-        """
-        from omnigent.claude_native_bridge import (
-            bridge_dir_for_bridge_id,
-            inject_plan_verdict,
-        )
-
-        content = data.get("content")
-        if data.get("action") != "accept":
-            verdict = "reject"
-        elif isinstance(content, dict) and content.get("allow_all_edits") is True:
-            verdict = "auto"
-        else:
-            verdict = "manual"
-        try:
-            bridge_id = await _claude_native_bridge_id_for_session(
-                server_client=server_client,
-                session_id=conv_id,
-            )
-            # Short timeout: a missing tmux.json means no pane to answer.
-            await asyncio.to_thread(
-                inject_plan_verdict,
-                bridge_dir_for_bridge_id(bridge_id),
-                verdict=verdict,
-                timeout_s=1.0,
-            )
-        except Exception:  # noqa: BLE001 — best-effort; TUI can still answer
-            _logger.debug(
-                "claude-native plan verdict not applied",
-                exc_info=True,
-                extra={"session_id": conv_id},
-            )
-
     async def _handle_cursor_native_model_change(
         conv_id: str,
         model: str | None,
@@ -5199,7 +5245,13 @@ def create_runner_app(
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "codex", "main") if registry is not None else None
         if instance is None or not instance.running:
-            return Response(status_code=204)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_compact_failed",
+                    "detail": "Codex terminal is not running; reconnect first.",
+                },
+            )
 
         socket_path = str(instance.socket_path)
         target = instance.tmux_target
@@ -5223,7 +5275,13 @@ def create_runner_app(
         server = _AUTO_OPENCODE_SERVERS.get(conv_id)
         state = read_bridge_state(bridge_dir_for_bridge_id(conv_id))
         if server is None or state is None or not state.opencode_session_id:
-            return Response(status_code=204)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "opencode_native_compact_failed",
+                    "detail": "OpenCode session is not active; reconnect first.",
+                },
+            )
         client = server.client()
         try:
             session = await client.get_session(state.opencode_session_id)
@@ -5232,7 +5290,13 @@ def create_runner_app(
                 session, messages, state.model_override
             )
             if not provider_id or not model_id:
-                return Response(status_code=204)
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "opencode_native_compact_failed",
+                        "detail": "Could not resolve a compaction model; try switching the model.",
+                    },
+                )
             await client.summarize(
                 state.opencode_session_id, provider_id=provider_id, model_id=model_id
             )
@@ -6088,13 +6152,16 @@ def create_runner_app(
             server_client, parent_id, notice, created_by=created_by
         )
         if delivered:
+            _stranded_wake_parents.discard(parent_id)
             if is_rewake:
                 _last_rewake_notice[parent_id] = notice
         else:
             _subagent_wake_pending.discard(parent_id)
+            _stranded_wake_parents.add(parent_id)
             _logger.warning(
                 "Sub-agent wake POST failed for parent=%s child=%s after %d attempt(s); "
-                "result remains in the parent inbox until the next wake",
+                "result remains in the parent inbox; the wake will be re-attempted "
+                "after the next tunnel reconnect or parent turn",
                 parent_id,
                 child_id,
                 _WAKE_POST_MAX_ATTEMPTS,
@@ -6142,9 +6209,14 @@ def create_runner_app(
             # re-wake no longer describes outstanding work; forget it or a
             # later episode's matching notice is wrongly deduped.
             _last_rewake_notice.pop(parent_session_id, None)
-        if parent_session_id not in _subagent_wake_pending:
+            _stranded_wake_parents.discard(parent_session_id)
+        # A parent whose wake POST exhausted its retries has no pending flag,
+        # but its inbox still holds an undelivered result — rescue it too.
+        stranded_retry = parent_session_id in _stranded_wake_parents
+        if parent_session_id not in _subagent_wake_pending and not stranded_retry:
             return
         _subagent_wake_pending.discard(parent_session_id)
+        _stranded_wake_parents.discard(parent_session_id)
         if drained:
             return
         entries = list_subagent_work(parent_session_id)
@@ -6155,6 +6227,75 @@ def create_runner_app(
             key=lambda entry: entry.completed_at if entry.completed_at is not None else 0.0,
         )
         _schedule_subagent_wake(latest, is_rewake=True)
+
+    async def _retry_stranded_wakes_soon() -> None:
+        # Paced rounds: a failed re-attempt lands the parent back in
+        # _stranded_wake_parents (see _post_subagent_wake_notice), so a later
+        # round picks it up once the handshake has had more time. In-flight
+        # attempts are deduped by _subagent_wake_pending. Recovery is bounded:
+        # a parent still failing after the last round stays stranded until the
+        # NEXT tunnel reconnect or an explicit parent turn re-attempts it.
+        for delay_s in _STRANDED_WAKE_RETRY_DELAYS_S:
+            await _wake_retry_sleep(delay_s)
+            if not _stranded_wake_parents:
+                return
+            for parent_id in list(_stranded_wake_parents):
+                _stranded_wake_parents.discard(parent_id)
+                inbox = _session_inboxes.get(parent_id)
+                if inbox is None or inbox.empty():
+                    continue
+                entries = list_subagent_work(parent_id)
+                if not entries:
+                    continue
+                latest = max(
+                    entries,
+                    key=lambda entry: (
+                        entry.completed_at if entry.completed_at is not None else 0.0
+                    ),
+                )
+                _logger.info(
+                    "Re-attempting stranded sub-agent wake for parent=%s after reconnect",
+                    parent_id,
+                    extra={"session_id": runner_primary_session_id()},
+                )
+                # Deliberately not is_rewake=True: skip the _last_rewake_notice
+                # dedup so the notice always re-sends after a reconnect; the
+                # drained-inbox check above prevents true duplicates.
+                _schedule_subagent_wake(latest)
+
+    def _retry_stranded_wakes() -> None:
+        # A wake POST that exhausted its bounded retries (the server was down
+        # when the child finished) left the result in the parent's inbox with
+        # nothing scheduled to re-deliver it — the wake is the sole delivery
+        # signal for an idle parent. The tunnel just reconnected, so the
+        # server is reachable again: re-attempt one wake per stranded parent
+        # whose inbox still holds results.
+        if not _stranded_wake_parents:
+            return
+        if _stranded_wake_retry_task and not _stranded_wake_retry_task[0].done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        _retry_task = loop.create_task(_retry_stranded_wakes_soon())
+        _stranded_wake_retry_task[:] = [_retry_task]
+
+        def _clear_retry_refs(task: asyncio.Task[None]) -> None:
+            _background_tasks.discard(task)
+            if _stranded_wake_retry_task and _stranded_wake_retry_task[0] is task:
+                _stranded_wake_retry_task.clear()
+            # Surface an unexpected failure instead of a GC-time warning;
+            # recovery degrades to the next reconnect or explicit parent turn.
+            if not task.cancelled() and task.exception() is not None:
+                _logger.warning(
+                    "Stranded sub-agent wake retry loop failed: %r",
+                    task.exception(),
+                    extra={"session_id": runner_primary_session_id()},
+                )
+
+        _retry_task.add_done_callback(_clear_retry_refs)
+        _background_tasks.add(_retry_task)
 
     def _mark_subagent_terminal_and_wake(
         child_session_id: str, *, status: str, output: str | None
@@ -6354,8 +6495,8 @@ def create_runner_app(
         try:
             await _run_turn_bg_setup_and_stream(msg_body, conv)
         except _ContextWindowOverflow:
-            # The streaming phase handles reactive compaction itself; re-raise so
-            # its handler is never shadowed by the generic except below.
+            # Re-raise so the streaming-phase handler (which publishes the
+            # error event) is never shadowed by the generic except below.
             raise
         except asyncio.CancelledError as exc:
             _logger.error(
@@ -6430,15 +6571,7 @@ def create_runner_app(
                 _dispatched_agent_id,
                 extra={"session_id": conv},
             )
-            _session_spec_cache.pop(conv, None)
-            _session_harness_overrides.pop(conv, None)
-            _session_skills_cache.pop(conv, None)
-            _session_cursor_model_names.pop(conv, None)
-            _drop_session_claude_launch_config(conv)
-            _session_tool_schemas.pop(conv, None)
-            _session_snapshot_cache.pop(conv, None)
-            if process_manager is not None:
-                await process_manager.release(conv)
+            await _invalidate_session_agent_state(conv, _dispatched_agent_id)
         if _dispatched_agent_id:
             _session_agent_ids[conv] = _dispatched_agent_id
 
@@ -6486,9 +6619,8 @@ def create_runner_app(
         if _sa_name and cached_spec is not None:
             sub_entry = _native_runtime._resolve_sub_agent_spec_entry(cached_spec_entry, _sa_name)
             if sub_entry is None:
-                # Suppress if the cache already holds the child spec (prior turn
-                # or POST /v1/sessions already swapped it in).
-                if cached_spec.name != _sa_name:
+                # Warn unless the child was confirmed resolved (True = already cached).
+                if _session_sub_agent_resolved.get(conv) is not True:
                     _warn_unresolved_sub_agent(conv, _sa_name)
             else:
                 cached_spec_entry = sub_entry
@@ -6517,6 +6649,7 @@ def create_runner_app(
             _session_histories[conv] = (
                 [] if is_native_harness(harness_name) else await _load_history_as_input(conv)
             )
+        _raw_per_request_instructions = cast(str | None, msg_body.get("instructions"))
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
@@ -6526,9 +6659,43 @@ def create_runner_app(
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
             )
-            from omnigent.runtime.prompt import build_instructions
-
-            instructions = build_instructions(cached_spec, None, [])
+            # Gated harnesses use nullable to avoid the fallback literal.
+            _authored_bg = raw_author_instructions(cached_spec) is not None
+            if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
+                instructions = build_instructions_nullable(
+                    cached_spec, _raw_per_request_instructions, []
+                )
+            else:
+                instructions = build_instructions(
+                    cached_spec,
+                    _raw_per_request_instructions,
+                    [],
+                )
+            # Warn once per (conversation, harness, delivery) if the agent has
+            # authored instructions but the harness can't deliver them.
+            if _authored_bg and harness_name:
+                _bg_caps = harness_capabilities().get(harness_name)
+                _bg_delivery = (
+                    _bg_caps.instruction_delivery
+                    if _bg_caps is not None
+                    else InstructionDelivery.UNKNOWN
+                )
+                _bg_warn_key = (harness_name, _bg_delivery)
+                if _bg_warn_key not in _instruction_delivery_warned.get(conv, ()):
+                    _instruction_delivery_warned.setdefault(conv, set()).add(_bg_warn_key)
+                    if _bg_delivery in (
+                        InstructionDelivery.NOT_DELIVERED,
+                        InstructionDelivery.UNKNOWN,
+                    ):
+                        _logger.warning(
+                            "agent instructions not delivered for session=%s "
+                            "harness=%s delivery=%s — authored instructions "
+                            "accepted but have no delivery channel on this harness.",
+                            conv,
+                            harness_name,
+                            _bg_delivery.value,
+                            extra={"session_id": conv},
+                        )
 
         ctx = TurnDispatch(
             agent_id=_dispatched_agent_id,
@@ -6838,6 +7005,13 @@ def create_runner_app(
             dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
         )
         _note_session_harness_override(conv_id, cast(str | None, body.get("harness_override")))
+        # Shared agent-switch invalidation for both dispatch paths.
+        _ds_agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
+        _ds_prior = _session_agent_ids.get(conv_id)
+        if _ds_agent_id and _ds_prior is not None and _ds_prior != _ds_agent_id:
+            await _invalidate_session_agent_state(conv_id, _ds_agent_id)
+        if _ds_agent_id:
+            _session_agent_ids[conv_id] = _ds_agent_id
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
@@ -7043,7 +7217,67 @@ def create_runner_app(
                 yield _response_failed_event({"message": _err_msg, "type": _err_type})
                 return
 
-            event_body = _wrap_as_message_event(body)
+            # Compose instructions for direct-stream turns (dispatch is None;
+            # background path pre-composes).
+            _instr_body = body
+            if dispatch is None:
+                with contextlib.suppress(OmnigentError, httpx.HTTPError, RuntimeError, ValueError):
+                    _instr_entry_ds = await _resolve_session_spec_entry(conv_id)
+                    _instr_spec_ds = _unwrap_resolved_spec(_instr_entry_ds)
+                    if _instr_spec_ds is not None:
+                        _per_req_instr = cast(str | None, body.get("instructions"))
+                        _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
+                        _ic_ds = InstructionComposition(
+                            authored_present=_authored_ds,
+                            composed=build_instructions_nullable(
+                                _instr_spec_ds, _per_req_instr, []
+                            ),
+                        )
+                        # Gated harnesses get nullable — skip the fallback literal.
+                        if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
+                            _instr_val = _ic_ds.composed
+                            if _instr_val is not None:
+                                _instr_body = {**body, "instructions": _instr_val}
+                        elif _ic_ds.composed is not None:
+                            _instr_body = {
+                                **body,
+                                "instructions": build_instructions(
+                                    _instr_spec_ds, _per_req_instr, []
+                                ),
+                            }
+                        if _authored_ds and harness_name:
+                            _ds_caps = harness_capabilities().get(harness_name)
+                            _ds_delivery = (
+                                _ds_caps.instruction_delivery
+                                if _ds_caps is not None
+                                else InstructionDelivery.UNKNOWN
+                            )
+                            _ds_warn_key = (harness_name, _ds_delivery)
+                            _already_warned_ds = _ds_warn_key in _instruction_delivery_warned.get(
+                                conv_id, ()
+                            )
+                            if not _already_warned_ds:
+                                _instruction_delivery_warned.setdefault(conv_id, set()).add(
+                                    _ds_warn_key
+                                )
+                                if _ds_delivery in (
+                                    InstructionDelivery.NOT_DELIVERED,
+                                    InstructionDelivery.UNKNOWN,
+                                ):
+                                    _logger.warning(
+                                        "agent instructions not delivered for session=%s "
+                                        "harness=%s delivery=%s — authored instructions "
+                                        "accepted but have no delivery channel on this harness.",
+                                        conv_id,
+                                        harness_name,
+                                        _ds_delivery.value,
+                                        extra={"session_id": conv_id},
+                                    )
+            # Re-warn on every turn when session-create established a miss.
+            _ds_sa = _session_sub_agent_names.get(conv_id)
+            if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:
+                _warn_unresolved_sub_agent(conv_id, _ds_sa)
+            event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
             try:
@@ -7924,8 +8158,6 @@ def create_runner_app(
             _data = body.get("data") or body
             _elicit_action = _data.get("action", "")
             pending_approvals.resolve(_data.get("elicitation_id", ""), _elicit_action == "accept")
-            if _session_harness_name(conversation_id) == "claude-native":
-                await _apply_claude_native_plan_verdict(conversation_id, _data)
             if _elicit_action == "decline":
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")
@@ -9227,8 +9459,10 @@ def create_runner_app(
                     )
                     if sub_entry is None:
                         _warn_unresolved_sub_agent(session_id, sub_agent_name)
+                        _session_sub_agent_resolved[session_id] = False
                     else:
                         spec_entry = sub_entry
+                        _session_sub_agent_resolved[session_id] = True
             if _session_cache_generation_is_current(session_id, generation):
                 _session_spec_cache[session_id] = spec_entry
             return spec_entry
@@ -9749,15 +9983,32 @@ def create_runner_app(
 
     def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
         _session_spec_cache.pop(session_id, None)
+        _session_agent_ids.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
+        # Bump so any in-flight fill discards its write rather than reinstating it.
+        _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
+        _session_snapshot_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
-        _session_snapshot_cache.pop(session_id, None)
+        _instruction_delivery_warned.pop(session_id, None)
+        _session_sub_agent_resolved.pop(session_id, None)
         if agent_id:
             _spec_cache.pop(agent_id, None)
+
+    async def _invalidate_session_agent_state(session_id: str, new_agent_id: str | None) -> None:
+        """Clear all agent-derived caches and release the harness subprocess.
+
+        Both dispatch paths (background ``_run_turn_bg_setup_and_stream`` and
+        direct-stream ``_stream_message_to_harness``) call this shared routine
+        on an in-conversation agent switch, so the eviction scope cannot
+        diverge between the two paths.
+        """
+        _clear_session_agent_caches(session_id, new_agent_id)
+        if process_manager is not None:
+            await process_manager.release(session_id)
 
     @app.delete("/v1/sessions/{session_id}/resources")
     async def cleanup_session_resources(
@@ -9865,13 +10116,7 @@ def create_runner_app(
             spec_entry = _session_spec_cache.get(session_id)
             spec = _unwrap_resolved_spec(spec_entry)
             if spec is None and spec_resolver is not None:
-                agent_id = _session_agent_ids.get(session_id)
-                if agent_id:
-                    try:
-                        resolved = await spec_resolver(agent_id, session_id)
-                        spec = _unwrap_resolved_spec(resolved)
-                    except Exception:  # noqa: BLE001
-                        pass
+                spec = await _resolve_session_agent_spec_or_none(session_id)
             if spec is None:
                 return JSONResponse(
                     status_code=200,
@@ -9933,13 +10178,7 @@ def create_runner_app(
                 spec_entry = _session_spec_cache.get(session_id)
                 spec = _unwrap_resolved_spec(spec_entry)
                 if spec is None and spec_resolver is not None:
-                    _agent_id = _session_agent_ids.get(session_id)
-                    if _agent_id:
-                        try:
-                            resolved = await spec_resolver(_agent_id, session_id)
-                            spec = _unwrap_resolved_spec(resolved)
-                        except Exception:  # noqa: BLE001
-                            pass
+                    spec = await _resolve_session_agent_spec_or_none(session_id)
                 if spec is None:
                     return JSONResponse(
                         status_code=200,
@@ -10010,14 +10249,12 @@ def create_runner_app(
                 spec_workdir = _resolved_workdir_for_spec(spec_entry, runner_workspace)
                 spec = _unwrap_resolved_spec(spec_entry)
                 if spec is None and spec_resolver is not None:
-                    _agent_id = _session_agent_ids.get(session_id)
-                    if _agent_id:
-                        try:
-                            resolved = await spec_resolver(_agent_id, session_id)
-                            spec_workdir = _resolved_workdir_for_spec(resolved, runner_workspace)
-                            spec = _unwrap_resolved_spec(resolved)
-                        except Exception:  # noqa: BLE001
-                            pass
+                    try:
+                        resolved_entry = await _resolve_session_spec_entry(session_id)
+                        spec_workdir = _resolved_workdir_for_spec(resolved_entry, runner_workspace)
+                        spec = _unwrap_resolved_spec(resolved_entry)
+                    except (OmnigentError, httpx.HTTPError, RuntimeError):
+                        pass
                 _agent_id_local = _session_agent_ids.get(session_id)
                 dispatch_workspace = (
                     # A resolved entry with no bundle dir gets no workspace at
@@ -10299,6 +10536,10 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": runner_primary_session_id()},
                 )
+        # A server outage at child-completion time fails the wake POST past its
+        # bounded retries; the server is reachable again now, so re-deliver
+        # those stranded wakes or the parent never learns its child finished.
+        _retry_stranded_wakes()
         for session_id in list(_session_histories):
             if _is_native_harness(session_id):
                 continue

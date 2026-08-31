@@ -1945,6 +1945,15 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     monkeypatch.setattr(_local_server_mod, "register_local_server", lambda port: None)
     monkeypatch.setattr(_local_server_mod, "clear_local_server_record", lambda: None)
 
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "session_title_instructions: Prefix titles with the current date.\n"
+        "branding:\n"
+        "  app_name: Must not leak into bare server config\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
     db_path = tmp_path / "chat.db"
     artifact_dir = tmp_path / "artifacts"
 
@@ -1977,6 +1986,9 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     assert captured["create_app_kwargs"]["runner_tunnel_tokens"] == frozenset(
         {"test-tunnel-token-abc"}
     )
+    assert captured["create_app_kwargs"]["server_config"] == {
+        "session_title_instructions": "Prefix titles with the current date."
+    }
 
 
 def test_server_explicit_config_overrides_omnigent_config_env(
@@ -4701,6 +4713,68 @@ def test_config_set_global_writes_auto_open_conversation_bool(
     assert _resolve_auto_open_conversation_from_config(cfg) is True
 
 
+def test_config_set_global_writes_session_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "config",
+            "set",
+            "--global",
+            "session_title_instructions=Prefix titles with the current date.",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert cfg["session_title_instructions"] == "Prefix titles with the current date."
+
+
+def test_config_set_rejects_project_local_session_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "config",
+            "set",
+            "session_title_instructions=Prefix titles with the current date.",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "session_title_instructions" in result.output
+    assert "only be set with --global" in result.output
+    assert not (tmp_path / ".omnigent" / "config.yaml").exists()
+
+
+def test_config_list_warns_about_project_local_session_title_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    local_path = tmp_path / ".omnigent" / "config.yaml"
+    local_path.parent.mkdir()
+    local_path.write_text("session_title_instructions: Prefix titles with the current date.\n")
+    monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "ignored user-level-only setting(s): session_title_instructions" in result.output
+    assert "set with --global" in result.output
+    assert "  session_title_instructions=" not in result.output
+
+
 def test_config_set_global_reports_effective_config_home(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -5518,6 +5592,39 @@ def test_unknown_command_reports_no_such_command(
     combined = terminal.out + terminal.err
     assert "No such command 'blah'" in combined
     assert "ad-hoc chat was removed" not in combined
+
+
+def test_setup_invalid_provider_is_a_user_error_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Malformed provider config exits actionably without crash reporting."""
+    from omnigent import cli as cli_module
+    from omnigent import crash_handler
+
+    message = (
+        "provider 'example-proxy' (kind 'gateway') configures no "
+        "'anthropic', 'openai', or 'gemini' family."
+    )
+    config = {"providers": {"example-proxy": {"kind": "gateway"}}}
+    crashes: list[Exception] = []
+    configure_flow = Mock()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["omnigent", "setup"])
+    monkeypatch.setattr(cli_module, "_load_global_config", lambda: config)
+    monkeypatch.setattr(cli_module, "_run_configure_harnesses_interactive", configure_flow)
+    monkeypatch.setattr(crash_handler, "handle_crash", lambda exc: crashes.append(exc))
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_module.main()
+
+    assert exc_info.value.code == 1
+    terminal = capsys.readouterr()
+    assert f"Invalid provider configuration in {tmp_path / 'config.yaml'}" in terminal.err
+    assert message in terminal.err
+    configure_flow.assert_not_called()
+    assert crashes == []
 
 
 def test_setup_command_replaces_wizard(monkeypatch: pytest.MonkeyPatch) -> None:
