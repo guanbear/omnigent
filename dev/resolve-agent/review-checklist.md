@@ -53,6 +53,12 @@ what to look for, and why it's wrong.
   trips the security exfil scan on added lines; the repo idiom
   `os.environ.copy()` is equivalent and passes.
 
+- **Never name a specific secret env var in a file that also makes network
+  calls.** The exfil scan blocks any added line naming a secret-shaped variable
+  (e.g. `DATABRICKS_TOKEN`, `GH_TOKEN`, `*_SECRET`) in a file whose added lines
+  also contain a network sink (httpx/requests/curl). Strip credentials by prefix
+  (`k.startswith("DATABRICKS_")`) instead of listing the secret's exact name.
+
 ## Rollback / cleanup
 
 - **Cleanup of an adopted resource must not destroy pre-existing user state.**
