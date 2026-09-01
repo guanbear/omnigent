@@ -2824,6 +2824,85 @@ def test_sessions_adapter_session_id_surfaces_as_conversation_id() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_sessions_adapter_retries_transient_elicitation_resolution() -> None:
+    """A transient resolve POST failure must not escape the event task.
+
+    The verdict may already have reached the server when the HTTP response
+    connection drops. Retrying is safe: a second successful POST completes
+    the elicitation, while an already-resolved response is handled by the
+    existing ``not_found`` branch.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import httpx
+    from omnigent_client import StreamHooks
+
+    client = MagicMock()
+    client.sessions.resolve_elicitation = AsyncMock(
+        side_effect=[httpx.ConnectError("connection dropped"), None],
+    )
+    adapter = _SessionsChatReplAdapter(
+        client=client,
+        agent_name="test-agent",
+        hooks=StreamHooks(on_elicitation_request=AsyncMock(return_value=True)),
+        session_id="conv_abc",
+    )
+    event = SimpleNamespace(
+        elicitation_id="elicit_abc",
+        message="approve?",
+        requested_schema={},
+        mode="form",
+        phase="tool_call",
+        policy_name="test-policy",
+        content_preview="",
+        url=None,
+    )
+
+    await adapter._handle_elicitation("conv_abc", event)
+
+    assert client.sessions.resolve_elicitation.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_sessions_adapter_contains_repeated_elicitation_transport_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Exhausted transport retries must not crash the REPL event loop."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import httpx
+    from omnigent_client import StreamHooks
+
+    client = MagicMock()
+    client.sessions.resolve_elicitation = AsyncMock(
+        side_effect=httpx.ConnectError("connection dropped"),
+    )
+    adapter = _SessionsChatReplAdapter(
+        client=client,
+        agent_name="test-agent",
+        hooks=StreamHooks(on_elicitation_request=AsyncMock(return_value=True)),
+        session_id="conv_abc",
+    )
+    event = SimpleNamespace(
+        elicitation_id="elicit_abc",
+        message="approve?",
+        requested_schema={},
+        mode="form",
+        phase="tool_call",
+        policy_name="test-policy",
+        content_preview="",
+        url=None,
+    )
+
+    await adapter._handle_elicitation("conv_abc", event)
+
+    assert client.sessions.resolve_elicitation.await_count == 3
+    assert "Could not resolve elicitation after transport retries" in caplog.text
+
+
 def test_legacy_session_falls_back_to_conversation_id() -> None:
     """Legacy sessions (no ``session_id`` attr) fall back to local var.
 

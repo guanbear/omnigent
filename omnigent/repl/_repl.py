@@ -2599,23 +2599,35 @@ class _SessionsChatReplAdapter:
                 else:
                     resolve_payload["action"] = "decline"
 
-        try:
-            # URL-based elicitation: deliver the verdict to the
-            # elicitation's dedicated resolve URL rather than as an
-            # in-band ``approval`` session event. Same server-side
-            # effect (both converge on ``_resolve_elicitation``).
-            await self._client.sessions.resolve_elicitation(
-                session_id,
-                elicitation_id,
-                resolve_payload,
-            )
-        except OmnigentError as exc:
-            if exc.code == "not_found":
-                # Elicitation already resolved by another client (e.g. web
-                # UI approved while the terminal prompt was still open).
-                # The harness already received the verdict — treat as no-op.
+        # URL-based elicitation: deliver the verdict to the elicitation's
+        # dedicated resolve URL rather than as an in-band ``approval`` event.
+        # A transport error can happen after the server accepted the POST but
+        # before the client received its response, so retrying is safe: the
+        # server either accepts the retry or reports the elicitation resolved.
+        for attempt in range(3):
+            try:
+                await self._client.sessions.resolve_elicitation(
+                    session_id,
+                    elicitation_id,
+                    resolve_payload,
+                )
                 return
-            raise
+            except OmnigentError as exc:
+                if exc.code == "not_found":
+                    # Another client may have resolved it while the terminal
+                    # prompt was open, or the first POST reached the server.
+                    return
+                raise
+            except Exception as exc:
+                if not _is_recoverable_sse_transport_error(exc):
+                    raise
+                if attempt == 2:
+                    _log.warning(
+                        "Could not resolve elicitation after transport retries",
+                        exc_info=exc,
+                    )
+                    return
+                await asyncio.sleep(0.1 * (2**attempt))
 
     async def _prompt_schema_fields(
         self,
