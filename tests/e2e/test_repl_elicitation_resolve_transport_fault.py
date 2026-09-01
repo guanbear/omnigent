@@ -168,6 +168,9 @@ class _FaultProxy:
         if loop is not None:
             for task in asyncio.all_tasks(loop):
                 loop.call_soon_threadsafe(task.cancel)
+        # Join the proxy thread so no background pump outlives the test.
+        if self._thread is not None:
+            self._thread.join(timeout=10)
 
 
 class _ProxiedSession:
@@ -286,18 +289,20 @@ def _build_repl_env(tmp_home: Path) -> dict[str, str]:
     (config_home / "config.yaml").write_text(
         "auto_open_conversation: false\ntui:\n  theme: dark\n",
     )
-    env = {
-        **os.environ,
-        "HOME": str(tmp_home),
-        "OMNIGENT_CONFIG_HOME": str(config_home),
-        "OMNIGENT_SKIP_ONBOARD": "1",
-        "OMNIGENT_NO_UPDATE_CHECK": "1",
-        "PYTHONPATH": merged_pp,
-        "TERM": "xterm-256color",
-        "LINES": "40",
-        "COLUMNS": "120",
-        "PROMPT_TOOLKIT_NO_CPR": "1",
-    }
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(tmp_home),
+            "OMNIGENT_CONFIG_HOME": str(config_home),
+            "OMNIGENT_SKIP_ONBOARD": "1",
+            "OMNIGENT_NO_UPDATE_CHECK": "1",
+            "PYTHONPATH": merged_pp,
+            "TERM": "xterm-256color",
+            "LINES": "40",
+            "COLUMNS": "120",
+            "PROMPT_TOOLKIT_NO_CPR": "1",
+        }
+    )
     for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE", "CLAUDECODE", "CODEX", "DATABRICKS_TOKEN"):
         env.pop(k, None)
     return ensure_repl_test_theme_env(env)

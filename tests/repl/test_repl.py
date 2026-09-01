@@ -2920,6 +2920,7 @@ def test_is_recoverable_sse_transport_error_for_write_errors() -> None:
     )
     assert _is_recoverable_sse_transport_error(httpcore.WriteError("connection reset"))
     assert _is_recoverable_sse_transport_error(httpx.WriteTimeout("write stalled"))
+    assert _is_recoverable_sse_transport_error(httpcore.WriteTimeout("write stalled"))
 
 
 def test_legacy_session_falls_back_to_conversation_id() -> None:
