@@ -55,9 +55,10 @@ what to look for, and why it's wrong.
 
 - **Never name a specific secret env var in a file that also makes network
   calls.** The exfil scan blocks any added line naming a secret-shaped variable
-  (e.g. `DATABRICKS_TOKEN`, `GH_TOKEN`, `*_SECRET`) in a file whose added lines
-  also contain a network sink (httpx/requests/curl). Strip credentials by prefix
-  (`k.startswith("DATABRICKS_")`) instead of listing the secret's exact name.
+  (a provider token / private-key / `*"_SECRET"`-suffixed name written out
+  verbatim) in a file whose added lines also contain a network-client sink.
+  Strip credentials by prefix (`k.startswith(<provider prefix>)`) instead of
+  listing the secret's exact name.
 
 ## Rollback / cleanup
 
