@@ -113,11 +113,18 @@ def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
         httpx.ReadTimeout,
         httpx.ConnectError,
         httpx.ConnectTimeout,
+        # A peer that drops the connection while the request is still
+        # being sent surfaces as a write error — the same transient
+        # interruption as a read-side drop, just caught one syscall earlier.
+        httpx.WriteError,
+        httpx.WriteTimeout,
         httpcore.RemoteProtocolError,
         httpcore.ReadError,
         httpcore.ReadTimeout,
         httpcore.ConnectError,
         httpcore.ConnectTimeout,
+        httpcore.WriteError,
+        httpcore.WriteTimeout,
     )
     seen: set[int] = set()
     current: BaseException | None = exc

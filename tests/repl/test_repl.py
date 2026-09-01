@@ -2903,6 +2903,25 @@ async def test_sessions_adapter_contains_repeated_elicitation_transport_failure(
     assert "Could not resolve elicitation after transport retries" in caplog.text
 
 
+def test_is_recoverable_sse_transport_error_for_write_errors() -> None:
+    """A peer dropping the connection mid-request-send is transient too.
+
+    An aborted connection can surface on the write side (the request
+    body was still being sent) rather than the read side. Both are the
+    same transient interruption; write errors must classify as
+    recoverable so the elicitation-resolve retry covers them.
+    """
+    import httpcore
+    import httpx
+
+    assert _is_recoverable_sse_transport_error(httpx.WriteError("connection reset")), (
+        "httpx.WriteError must classify as recoverable — a mid-send "
+        "connection drop is the write-side twin of a read-side drop."
+    )
+    assert _is_recoverable_sse_transport_error(httpcore.WriteError("connection reset"))
+    assert _is_recoverable_sse_transport_error(httpx.WriteTimeout("write stalled"))
+
+
 def test_legacy_session_falls_back_to_conversation_id() -> None:
     """Legacy sessions (no ``session_id`` attr) fall back to local var.
 
