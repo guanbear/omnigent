@@ -303,7 +303,12 @@ def _build_repl_env(tmp_home: Path) -> dict[str, str]:
             "PROMPT_TOOLKIT_NO_CPR": "1",
         }
     )
-    for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE", "CLAUDECODE", "CODEX", "DATABRICKS_TOKEN"):
+    # Strip every ambient credential/harness marker so the spawned REPL is a
+    # pure client — a leaked provider var reroutes its credential resolution.
+    for k in list(env):
+        if k.startswith("DATABRICKS_"):
+            env.pop(k, None)
+    for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE", "CLAUDECODE", "CODEX"):
         env.pop(k, None)
     return ensure_repl_test_theme_env(env)
 
