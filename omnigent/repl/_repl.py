@@ -2014,6 +2014,41 @@ class _SessionsChatReplAdapter:
             )
         )
 
+    def _emit_elicitation_resolve_error(self, exc: Exception) -> None:
+        """
+        Render an undeliverable elicitation verdict in the error panel.
+
+        Bounded transport retries can still end with the verdict
+        undelivered, which leaves the elicitation parked server-side and
+        the turn waiting on an answer that will never arrive. Emitting the
+        same typed error event normal streams use lets the existing REPL
+        renderer show it, so the user learns to re-answer rather than
+        sitting at an apparently live prompt.
+
+        :param exc: Last transport failure raised by the resolve POST,
+            e.g. an ``httpx.ConnectError``.
+        :returns: None.
+        """
+        if self._on_event is None:
+            return
+
+        from omnigent.server.schemas import ErrorEvent, RetryErrorDetail
+
+        self._on_event(
+            ErrorEvent(
+                type="response.error",
+                source="execution",
+                error=RetryErrorDetail(
+                    code="elicitation_resolve_failed",
+                    message=(
+                        f"Could not deliver your answer to the server: {exc}. "
+                        "The request is still waiting, so answer it again here "
+                        "or from the web UI."
+                    ),
+                ),
+            )
+        )
+
     def _runner_recovery_error_message(self, exc: Exception) -> str:
         """
         Build the user-facing message for a recovery failure.
@@ -2629,10 +2664,17 @@ class _SessionsChatReplAdapter:
                 if not _is_recoverable_sse_transport_error(exc):
                     raise
                 if attempt == 2:
-                    _log.warning(
-                        "Could not resolve elicitation after transport retries",
-                        exc_info=exc,
-                    )
+                    # One line here, postmortem behind DEBUG: the REPL
+                    # configures no log handlers, so a WARNING carrying
+                    # exc_info falls through to ``logging.lastResort`` and
+                    # paints a traceback over the TUI frame. Same split
+                    # ``_stream_pump`` makes for the same reason.
+                    _log.warning("Could not resolve elicitation after transport retries")
+                    _log.debug("elicitation resolve failed", exc_info=exc)
+                    # The elicitation is still parked server-side, so the
+                    # turn waits on a verdict that will never arrive. Say so
+                    # instead of leaving an apparently live prompt.
+                    self._emit_elicitation_resolve_error(exc)
                     return
                 await asyncio.sleep(0.1 * (2**attempt))
 
