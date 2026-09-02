@@ -144,15 +144,32 @@ def test_should_discover_polls_while_active_or_observing() -> None:
     )
 
 
-def test_should_stop_polling_when_idle_at_top_level() -> None:
-    """Once everything settles at the top level the loop goes quiet — retained
-    finished sub-agents no longer change status, so polling them is pure waste.
-    A child that later resumes re-arms the poll via the active stream's SSE."""
+def test_should_pause_fast_polling_when_idle_at_top_level() -> None:
+    """A settled top-level tree pauses the fast poll between reconciliations."""
     assert not _should_discover_subagents(
         "conv_main",
         has_active_subagents=False,
         observing_subagent=False,
         last_polled_root="conv_main",
+        settled_reconcile_due=False,
+    )
+
+
+def test_should_periodically_reconcile_retained_idle_children() -> None:
+    """A low-frequency snapshot can notice a reused child becoming busy.
+
+    Reusing an existing child handle does not always emit a fresh
+    ``session.child_session.updated`` event on an idle parent's stream.  The
+    fast poll is still disabled while the retained tree appears settled, but a
+    due reconciliation must re-fetch it so stale ``Idle`` state cannot persist
+    forever.
+    """
+    assert _should_discover_subagents(
+        "conv_main",
+        has_active_subagents=False,
+        observing_subagent=False,
+        last_polled_root="conv_main",
+        settled_reconcile_due=True,
     )
 
 

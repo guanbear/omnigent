@@ -269,3 +269,7 @@ def test_run_repl_wires_subagent_plumbing() -> None:
         "existing children won't repopulate the selector without fresh SSE, "
         "or the poll no longer gates on active work and spins forever idle."
     )
+    assert "_subagent_reconcile_requested" in src, (
+        "a parent waiting edge no longer requests a child-tree snapshot — "
+        "reused children can remain falsely Idle until the slow fallback poll."
+    )

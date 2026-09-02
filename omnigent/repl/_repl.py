@@ -225,6 +225,11 @@ _LIST_ITEMS_PAGE_SIZE = 100
 # session's direct children) while sub-agents are active.
 _MAX_SUBAGENT_TREE_DEPTH = 3
 _SUBAGENT_POLL_SECONDS = 2.0
+# A reused child can become busy without publishing a fresh update on an idle
+# parent's SSE stream.  Keep the fast poll asleep for settled trees, but
+# periodically reconcile retained child handles so stale ``Idle`` state is
+# bounded rather than permanent (issue #6162).
+_SUBAGENT_SETTLED_RECONCILE_SECONDS = 30.0
 
 
 def _load_startup_theme() -> TerminalTheme:
@@ -3392,6 +3397,10 @@ async def run_repl(
     # (new turn begins) so the idle-event local-estimate fallback fires
     # on every turn for harnesses that never report usage (e.g. codex).
     _context_ring_state: list[bool] = [False]  # [last_completed_had_usage]
+    # A parent entering ``waiting`` has commonly just delegated work.  Request
+    # an immediate child-tree snapshot on the next poll tick; the event handler
+    # is defined before the poll loop, so a mutable cell bridges the closures.
+    _subagent_reconcile_requested: list[bool] = [False]
 
     def _flush_inflight_assistant_text() -> list[FormattedItem]:
         """
@@ -3542,6 +3551,9 @@ async def run_repl(
                 _spawn_metadata_refresh()
             elif event.status in ("idle", "waiting", "failed"):
                 from omnigent_client import TextDone
+
+                if event.status == "waiting":
+                    _subagent_reconcile_requested[0] = True
 
                 # A SETUP-phase failure (spec resolution, spawn-env
                 # build) ends the turn before the LLM stream starts, so
@@ -4382,6 +4394,7 @@ async def run_repl(
     # session that already has children, with no fresh SSE to seed them) even
     # though no sub-agents are registered yet — see ``_subagent_poll_loop``.
     polled_root: list[str | None] = [None]
+    last_subagent_reconcile_at: list[float] = [0.0]
 
     def _sync_subagent_root() -> None:
         # Track the live top-level session id while we're at the top. While
@@ -4419,10 +4432,10 @@ async def run_repl(
         # just changed (the discovery poll that repopulates the selector after a
         # resume / ``/switch`` into a session that already has children, which
         # would otherwise never poll: no SSE, no nodes yet). It deliberately
-        # goes quiet once everything settles at the top level: a finished
-        # sub-agent's status no longer changes, so polling retained-but-terminal
-        # nodes forever is pure waste; a child that later resumes re-arms the
-        # poll via the active stream's ``session.child_session.updated``.
+        # drops to a 30-second reconciliation once everything settles at the
+        # top level. A parent ``waiting`` edge requests an immediate snapshot;
+        # the low-frequency fallback covers reused children whose parent stream
+        # emits no fresh ``session.child_session.updated`` event.
         while True:
             try:
                 _sync_subagent_root()
@@ -4430,14 +4443,22 @@ async def run_repl(
                 observing_subagent = getattr(session, "_readonly_view", False) or getattr(
                     session, "_interactive_child", False
                 )
+                now = asyncio.get_running_loop().time()
+                settled_reconcile_due = _subagent_reconcile_requested[0] or (
+                    host.has_any_subagents()
+                    and now - last_subagent_reconcile_at[0] >= _SUBAGENT_SETTLED_RECONCILE_SECONDS
+                )
                 if _should_discover_subagents(
                     root_id,
                     has_active_subagents=host.has_active_subagents(),
                     observing_subagent=observing_subagent,
                     last_polled_root=polled_root[0],
+                    settled_reconcile_due=settled_reconcile_due,
                 ):
                     await _refresh_subagents()
                     polled_root[0] = root_id
+                    last_subagent_reconcile_at[0] = now
+                    _subagent_reconcile_requested[0] = False
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — best-effort background poll; never crash the REPL
@@ -6510,6 +6531,7 @@ def _should_discover_subagents(
     has_active_subagents: bool,
     observing_subagent: bool,
     last_polled_root: str | None,
+    settled_reconcile_due: bool = False,
 ) -> bool:
     """Decide whether the background loop should (re-)fetch the sub-agent tree.
 
@@ -6525,26 +6547,35 @@ def _should_discover_subagents(
       the badge) fresh while chatting; or
     * ``last_polled_root != root_id`` — the root just changed: a one-shot
       discovery that repopulates the selector for a resumed / ``/switch``-ed
-      session that already has children (no fresh SSE to seed them).
+      session that already has children (no fresh SSE to seed them); or
+    * ``settled_reconcile_due`` — a retained, apparently idle tree is due for
+      its low-frequency snapshot reconciliation.  This catches a reused child
+      becoming busy when the idle parent's stream emits no fresh child update.
 
     Deliberately keyed on *active* work, NOT merely "any node exists": finished
     sub-agents are retained in the selector indefinitely (web parity), but a
-    terminal child's status no longer changes, so polling it forever is pure
-    waste. Once everything settles at the top level the loop goes quiet; a child
-    that later resumes does so on the active (root) stream, whose SSE
-    ``session.child_session.updated`` re-arms ``has_active_subagents`` and the
-    poll wakes again.
+    terminal child's status normally no longer changes, so the 2-second poll
+    goes quiet once everything settles.  Retained handles are reconciled at a
+    much lower frequency because reuse is allowed and does not always publish a
+    fresh child update on the parent stream.
 
     :param root_id: The current tree root (top-level session id), or ``None``.
     :param has_active_subagents: Whether any sub-agent is still running.
     :param observing_subagent: Whether the user is currently viewing/co-driving
         a child (so the parent-rooted poll is what keeps that child fresh).
     :param last_polled_root: The root the loop last ran discovery for.
+    :param settled_reconcile_due: Whether the low-frequency reconciliation for
+        a retained settled tree is due.
     :returns: ``True`` to fetch the tree this tick.
     """
     if root_id is None:
         return False
-    return has_active_subagents or observing_subagent or last_polled_root != root_id
+    return (
+        has_active_subagents
+        or observing_subagent
+        or last_polled_root != root_id
+        or settled_reconcile_due
+    )
 
 
 def _apply_child_session_event(
