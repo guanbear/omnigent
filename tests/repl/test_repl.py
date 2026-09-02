@@ -2959,7 +2959,10 @@ async def test_sessions_adapter_surfaces_undeliverable_elicitation_verdict() -> 
     emitted = rendered[0]
     assert emitted.type == "response.error"
     assert emitted.error.code == "elicitation_resolve_failed"
-    assert "answer it again" in emitted.error.message
+    # Names the surface that can still answer: the terminal prompt is gone
+    # by now, so pointing the user back at it would be a dead end.
+    assert "web UI" in emitted.error.message
+    assert "still waiting" in emitted.error.message
 
 
 def test_is_recoverable_sse_transport_error_for_write_errors() -> None:

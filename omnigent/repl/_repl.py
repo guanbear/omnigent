@@ -2042,8 +2042,8 @@ class _SessionsChatReplAdapter:
                     code="elicitation_resolve_failed",
                     message=(
                         f"Could not deliver your answer to the server: {exc}. "
-                        "The request is still waiting, so answer it again here "
-                        "or from the web UI."
+                        "The request is still waiting for an answer, and this "
+                        "prompt is gone, so answer it from the web UI."
                     ),
                 ),
             )
