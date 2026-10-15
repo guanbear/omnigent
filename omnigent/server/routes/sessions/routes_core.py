@@ -1023,6 +1023,8 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
             )
+            if parsed_metadata.host_id is not None:
+                inherited_runner_id = None
 
         bundle_bytes = await bundle.read()
         # Validate the bundle BEFORE any row exists: the external-host

@@ -3584,6 +3584,11 @@ async def _heal_subagent_runner_binding_via_parent(
     :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
         after healing, or ``None`` when no live ancestor could be found.
     """
+    # A host-bound child owns an independent execution environment. A parent
+    # reconnect must not move its tools or workspace onto another machine.
+    if child_conv.host_id is not None:
+        return None
+
     # Walk the ancestor chain (immediate parent first, then root) to find a
     # live runner.  A single hop covers the common case; two hops cover nested
     # sub-agents where the immediate parent's runner is also stale but the root
@@ -10901,10 +10906,9 @@ async def _create_session_from_existing_agent(
                 _validate_acp_spec_models, selection_spec, model_override, harness_override
             )
 
-    # Inherit runner affinity from the parent session so the child
-    # is assigned to the same runner (sub-agent co-location).
+    # Co-locate by default; an explicit host selects an independent runner.
     inherited_runner_id: str | None = None
-    if body.parent_session_id is not None:
+    if body.parent_session_id is not None and body.host_id is None:
         parent_conv = _parent_for_routing
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id

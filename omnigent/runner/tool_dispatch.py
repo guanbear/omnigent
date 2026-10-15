@@ -3308,6 +3308,8 @@ def _build_session_create_body(
     message: object,
     model: object = None,
     reasoning_effort: object = None,
+    host_id: object = None,
+    workspace: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -3335,12 +3337,16 @@ def _build_session_create_body(
         written as ``model_override`` on the session.
     :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
         written as ``reasoning_effort`` on the session.
+    :param host_id: Optional registered execution host, validated by the server.
+    :param workspace: Absolute working directory on that host, not the caller's machine.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
     }
+    if isinstance(host_id, str) and isinstance(workspace, str):
+        body.update(host_id=host_id, workspace=workspace)
     if isinstance(title, str) and title:
         body["title"] = title
     if isinstance(model, str) and model:
@@ -3442,8 +3448,8 @@ async def _execute_session_create(
       ``POST /v1/sessions`` create.
 
     Both modes force ``parent_session_id`` to the caller (child-only).
-    The child inherits the caller's runner (server-side affinity), so a
-    queued initial message starts a turn immediately. Returns a handle
+    The child inherits the caller's runner unless an explicit registered
+    ``host_id`` and remote ``workspace`` select its own runner. Returns a handle
     the orchestrator can monitor (``sys_session_get_history`` /
     ``sys_session_get_info``) or drive (``sys_session_send`` by
     ``conversation_id``) — unlike named-mode send, it does NOT block on
@@ -3485,6 +3491,21 @@ async def _execute_session_create(
                 )
             }
         )
+    host_id, workspace = args.get("host_id"), args.get("workspace")
+    if host_id is not None or workspace is not None:
+        if not (
+            isinstance(host_id, str)
+            and host_id.strip()
+            and isinstance(workspace, str)
+            and workspace.strip()
+        ):
+            return json.dumps(
+                {
+                    "error": (
+                        "sys_session_create requires non-empty 'host_id' and 'workspace' together"
+                    )
+                }
+            )
     if has_config_path:
         # The multipart create carries only the config bundle, so an effort
         # passed here would never reach the child. Refuse instead of dropping it.
@@ -3511,9 +3532,13 @@ async def _execute_session_create(
         str(agent_id),
         conversation_id,
         args.get("title"),
-        args.get("message"),
+        # A host launch binds its runner after creation. Seeded history alone
+        # does not execute a turn there; post the message after the launch.
+        args.get("message") if host_id is None else None,
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
+        host_id=host_id,
+        workspace=workspace,
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -3530,6 +3555,11 @@ async def _execute_session_create(
     data = resp.json()
     if not isinstance(data.get("id"), str) or not data["id"]:
         return json.dumps({"error": "server did not return a child session id"})
+    message = args.get("message")
+    if host_id is not None and isinstance(message, str) and message:
+        message_error = await _post_child_first_message(data["id"], message, server_client)
+        if message_error is not None:
+            return message_error
     return _finalize_created_session(
         data,
         conversation_id=conversation_id,
@@ -3586,7 +3616,7 @@ async def _post_child_first_message(
     server_client: httpx.AsyncClient,
 ) -> str | None:
     """
-    Queue a bundle-created child's first user message.
+    Queue a newly created child's first user message after its host launch.
 
     Posted as a separate event so the server's post_event forwards it
     to the runner and starts the child turn (same pattern as
@@ -3677,6 +3707,8 @@ async def _upload_config_bundle(
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
     metadata: _JsonObject = {"parent_session_id": conversation_id}
+    if args.get("host_id") is not None:
+        metadata.update(host_id=args["host_id"], workspace=args["workspace"])
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
