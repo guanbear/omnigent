@@ -11158,8 +11158,13 @@ async def _create_session_from_existing_agent(
     # that user can never change code running here. A child reusing its parent's
     # agent stays on it: collaborators act in the owner's session. A failed create
     # below keeps the copy: it is listed to its owner from the start, so another of
-    # their requests may already be using it.
-    if _parent_for_routing is None or _parent_for_routing.agent_id != agent.id:
+    # their requests may already be using it. Independent host placement must
+    # keep this copy boundary even when the agent matches the shared parent.
+    if (
+        body.host_id is not None
+        or _parent_for_routing is None
+        or _parent_for_routing.agent_id != agent.id
+    ):
         agent = await asyncio.to_thread(
             agent_for_user, agent_store, artifact_store, agent, user_id
         )

@@ -8221,7 +8221,8 @@ async def test_sys_agent_list_merges_three_sources(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_maps_agent_not_found() -> None:
+@pytest.mark.parametrize("remote_host", [False, True])
+async def test_sys_session_create_maps_agent_not_found(remote_host: bool) -> None:
     """
     A 404 from the create maps to ``agent_not_found`` so the LLM gets a
     typed reason rather than a raw status. If the mapping regressed, the
@@ -8230,22 +8231,31 @@ async def test_sys_session_create_maps_agent_not_found() -> None:
     from omnigent.runner.tool_dispatch import execute_tool
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if remote_host:
+            return httpx.Response(404, json={"detail": "host not found"})
         return httpx.Response(404, json={"error": "no agent"})
 
+    arguments = {"agent_id": "ag_missing"}
+    if remote_host:
+        arguments.update(host_id="host_missing", workspace="/work/repo")
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
         base_url="http://server",
     ) as server_client:
         output = await execute_tool(
             tool_name="sys_session_create",
-            arguments=json.dumps({"agent_id": "ag_missing"}),
+            arguments=json.dumps(arguments),
             server_client=server_client,
             conversation_id="conv_caller",
         )
 
     info = json.loads(output)
-    assert info["error"] == "agent_not_found"
-    assert info["agent_id"] == "ag_missing"
+    if remote_host:
+        assert info["error"] == "sys_session_create returned 404"
+        assert "host not found" in info["detail"]
+    else:
+        assert info["error"] == "agent_not_found"
+        assert info["agent_id"] == "ag_missing"
 
 
 @pytest.mark.asyncio

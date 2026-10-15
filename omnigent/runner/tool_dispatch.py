@@ -3544,7 +3544,7 @@ async def _execute_session_create(
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
-    if resp.status_code == 404:
+    if resp.status_code == 404 and host_id is None:
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "agent_id": agent_id})
