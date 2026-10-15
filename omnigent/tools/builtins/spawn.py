@@ -1805,7 +1805,12 @@ class SysSessionCloseTool(Tool):
         busy_error = _busy_check_or_none(child_conv_id=resolution.child.id)
         if busy_error is not None:
             return busy_error
-        labelled = _agent_title_from_conversation(resolution.child)
+        child = resolution.child
+        labelled = (
+            _agent_title_from_conversation(child)
+            if child.title and ":" in child.title
+            else _AgentTitle(agent="agent", title=child.title or "")
+        )
         # Re-build the tombstoned title from the parsed components so
         # the marker lands in the canonical position even if the
         # original title used uncommon characters around the colon.

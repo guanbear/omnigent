@@ -250,6 +250,7 @@ async def test_multipart_create_with_host_id_binds_and_launches(
         parent = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
         assert parent.status_code == 201, parent.text
         metadata["parent_session_id"] = parent.json()["id"]
+        metadata["child_session_id"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         conv_store.set_runner_id(parent.json()["id"], "runner_parent")
 
     with capture_debug_rows("server") as rows:
@@ -268,9 +269,12 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     assert conv.workspace == _WORKSPACE
     assert conv.runner_id is not None and conv.runner_id.startswith("runner_token_")
     if as_child:
+        assert conv.id == metadata["child_session_id"]
         assert conv.parent_conversation_id == metadata["parent_session_id"]
         assert conv.kind == "sub_agent"
         assert conv.runner_id != "runner_parent"
+        duplicate = await _multipart_create(client, metadata)
+        assert duplicate.status_code == 409, duplicate.text
 
     # The host actually received a launch frame for this session with
     # the validated workspace (not just a row write).
