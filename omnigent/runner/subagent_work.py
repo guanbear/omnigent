@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from fastapi.responses import JSONResponse
 
+from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.remote_child_protocol import SUBAGENT_DELIVERED_ID_LABEL_KEY
@@ -433,6 +434,46 @@ def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
     return agent is not None and wrapper_label == agent.subagent_wrapper_label
 
 
+def latest_wake_eligible_subagent_work(
+    entries: list[_SubagentWorkEntry],
+) -> _SubagentWorkEntry | None:
+    """
+    The most recently completed entry that still owes the parent an inbox wake.
+
+    Stranded-wake recovery nudges an idle parent to drain its inbox, so it must
+    skip codex-native sub-agents: a suppressed thread completing after an
+    independent child would otherwise shadow the child's stranded wake, which
+    the ownership guard then drops.
+
+    :param entries: Candidate work entries for one parent.
+    :returns: The latest wake-eligible entry, or ``None`` when every entry is a
+        codex-native sub-agent.
+    """
+    eligible = [
+        entry for entry in entries if not is_codex_native_subagent_wrapper(entry.wrapper_label)
+    ]
+    if not eligible:
+        return None
+    return max(
+        eligible,
+        key=lambda entry: entry.completed_at if entry.completed_at is not None else 0.0,
+    )
+
+
+def wrapper_label_from_labels(labels: object) -> str | None:
+    """
+    Return a child's ``omnigent.wrapper`` label from its session labels.
+
+    :param labels: Session labels as the server returns them, e.g.
+        ``{"omnigent.wrapper": "codex-native-ui"}``.
+    :returns: The wrapper label, or ``None`` when absent or not a string.
+    """
+    if not isinstance(labels, Mapping):
+        return None
+    wrapper = labels.get(WRAPPER_LABEL_KEY)
+    return wrapper if isinstance(wrapper, str) and wrapper else None
+
+
 def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None:
     """
     Return the dispatch id of a child turn whose result the parent never drained.
@@ -580,14 +621,15 @@ async def _recover_subagent_results_from_server(
             child_id in _drained_delivered_subagent_children
         ):
             continue
-        labels = child.get("labels")
+        raw_labels = child.get("labels")
+        labels = raw_labels if isinstance(raw_labels, dict) else {}
         from omnigent.remote_child_protocol import remote_child_state
 
-        remote = remote_child_state(labels) if isinstance(labels, dict) else None
+        remote = remote_child_state(labels)
         dispatch_id = (
             remote["dispatch_id"]
             if remote is not None
-            else undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
+            else undelivered_subagent_dispatch_id(labels)
         )
         if remote is not None:
             if remote.get("status") not in _SUBAGENT_TERMINAL_STATUSES:
@@ -597,15 +639,13 @@ async def _recover_subagent_results_from_server(
                         child_session_id=child_id,
                         agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
                         title=str(child.get("session_name") or ""),
+                        wrapper_label=wrapper_label_from_labels(labels),
                         work_id=dispatch_id,
                     )
                     pending.status = "waiting"
                     pending.remote = True
                 continue
-            if (
-                isinstance(labels, dict)
-                and labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id
-            ):
+            if labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
                 continue
             status = remote["status"]
             interrupted = False
@@ -653,6 +693,7 @@ async def _recover_subagent_results_from_server(
             child_session_id=child_id,
             agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
             title=str(child.get("session_name") or ""),
+            wrapper_label=wrapper_label_from_labels(labels),
             work_id=dispatch_id,
         )
         entry.remote = remote is not None
