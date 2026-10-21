@@ -114,9 +114,7 @@ def test_registered_child_survives_parent_restart_and_closes_only_its_runner(
         assert child["runner_id"] != live_runner_id
         assert child["parent_session_id"] == parent_id
 
-        restart_live_runner()
-        if restart_while_running:
-            _wait_for_text(http_client, parent_id, "RESULT_READY_NOT_DRAINED", timeout=120)
+        # Arm recovery before restart so its automatic wake owns this response queue.
         configure_mock_llm(
             mock_llm_server_url,
             [
@@ -125,8 +123,9 @@ def test_registered_child_survives_parent_restart_and_closes_only_its_runner(
             ],
             key=parent_model,
         )
-        send_user_message_to_session(http_client, session_id=parent_id, content="Collect A")
+        restart_live_runner()
         _wait_for_text(http_client, parent_id, "REMOTE_RESULT_A", timeout=90)
+        _wait_for_text(http_client, parent_id, "Result A collected.", timeout=30)
 
         configure_mock_llm(mock_llm_server_url, [{"text": "REMOTE_RESULT_B"}], key=child_model)
         configure_mock_llm(
@@ -152,6 +151,7 @@ def test_registered_child_survives_parent_restart_and_closes_only_its_runner(
         )
         send_user_message_to_session(http_client, session_id=parent_id, content="Continue B")
         _wait_for_text(http_client, parent_id, "REMOTE_RESULT_B", timeout=120)
+        _wait_for_text(http_client, parent_id, "Result B collected.", timeout=30)
         assert len(http_client.get(f"/v1/sessions/{parent_id}/child_sessions").json()["data"]) == 1
         assert "REMOTE_RESULT_B" in json.dumps(_session_items(http_client, child_id))
 
